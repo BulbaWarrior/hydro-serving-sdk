@@ -4,23 +4,24 @@ import logging
 import os
 import tarfile
 import time
-import urllib.parse
 from enum import Enum
-from typing import Optional, Dict, List, Tuple, Iterator, Generator
+from pathlib import Path
+from typing import Optional, Dict, List, Tuple, Iterator
 
-import sseclient
 import requests
-from sseclient import Event
+import sseclient
 from hydro_serving_grpc.contract import ModelContract
 from hydro_serving_grpc.manager import ModelVersion as ModelVersionProto, DockerImage as DockerImageProto
+from hydroserving.core.contract import contract_from_dict
 from requests_toolbelt.multipart.encoder import MultipartEncoder
+from sseclient import Event
 
 from hydrosdk.cluster import Cluster
 from hydrosdk.contract import ModelContract_to_contract_dict, contract_dict_to_ModelContract, validate_contract
+from hydrosdk.exceptions import HydrosphereException, TimeoutException, IncorrectDefinitionException
 from hydrosdk.image import DockerImage
 from hydrosdk.monitoring import MetricSpec, MetricSpecConfig, MetricModel, ThresholdCmpOp
-from hydrosdk.exceptions import HydrosphereException, TimeoutException
-from hydrosdk.utils import handle_request_error, read_in_chunks
+from hydrosdk.utils import handle_request_error, read_in_chunks, yaml_file
 
 
 def _upload_training_data(cluster: Cluster, modelversion_id: int, path: str) -> 'DataUploadResponse':
@@ -42,7 +43,7 @@ def _upload_training_data(cluster: Cluster, modelversion_id: int, path: str) -> 
     raise BadResponse('Failed to upload training data')
 
 
-def _upload_local_file(cluster: Cluster, modelversion_id: int, path: str, 
+def _upload_local_file(cluster: Cluster, modelversion_id: int, path: str,
                        chunk_size=1024) -> requests.Response:
     """
     Internal method for uploading local training data to Hydrosphere.
@@ -51,7 +52,7 @@ def _upload_local_file(cluster: Cluster, modelversion_id: int, path: str,
     :param modelversion_id: modelversion_id for which to upload training data
     :param path: path to a local file
     :param chunk_size: chunk size to use for streaming
-    """    
+    """
     gen = read_in_chunks(path, chunk_size)
     url = f'/monitoring/profiles/batch/{modelversion_id}'
     return cluster.request("POST", url, data=gen, stream=True)
@@ -67,7 +68,7 @@ def _upload_s3_file(cluster: Cluster, modelversion_id: int, path: str) -> reques
     """
     url = f'/monitoring/profiles/batch/{modelversion_id}/s3'
     return cluster.request("POST", url, json={"path": path})
-    
+
 
 def resolve_paths(path: str, payload: List[str]) -> Dict[str, str]:
     """
@@ -102,6 +103,7 @@ class LocalModel:
     >>> from hydrosdk.cluster import Cluster
     >>> from hydrosdk.image import DockerImage
     >>> from hydrosdk.contract import SignatureBuilder, ProfilingType, ModelContract
+    >>> model_root = 'model'
     >>> cluster = Cluster("http-cluster-endpoint")
     >>> runtime = DockerImage("hydrosphere/serving-runtime-python-3.7", "latest", None)
     >>> payload = ["src/func_main.py", "requirements.txt"]
@@ -112,30 +114,33 @@ class LocalModel:
     >>> install_command = "pip install -r requirements.txt"
     >>> training_data = "training-data.csv"
     >>> contract = ModelContract(predict=signature)
-    >>> localmodel = LocalModel(name="my-model", runtime=runtime, payload=payload, contract=contract
+    >>> localmodel = LocalModel(name="my-model", path=model_root, runtime=runtime, payload=payload, contract=contract
                                 install_command=install_command, training_data=training_data)
     >>> model_version = localmodel.upload(cluster)
     >>> model_version.lock_till_released()
     >>> data_upload_response = model_version.upload_training_data()
     """
-    def __init__(self, name: str, runtime: DockerImage, path: str, payload: List[str], 
-                 contract: ModelContract, metadata: Optional[Dict[str, str]] = None, 
+
+    def __init__(self, name: str, runtime: DockerImage, path: str, payload: List[str],
+                 contract: ModelContract, metadata: Optional[Dict[str, str]] = None,
                  install_command: Optional[str] = None,
                  training_data: Optional[str] = None,
-                 monitoring_configuration: Optional[MonitoringConfiguration] = None) -> 'LocalModel':
+                 monitoring_configuration: Optional[MonitoringConfiguration] = None,
+                 metrics: Optional[Dict[str, MetricSpecConfig]] = None) -> 'LocalModel':
         """
         :param name: a name of the model
         :param runtime: a docker image used to run your code
         :param payload: a list of paths to files (absolute or relative) with any additional resources 
                         that will be exported to the container
         :param path: a path to the root folder of the model
-        :param contract: ModelContract which specifies name of function called, as well as its types 
+        :param contract: ModelContract which specifies name of function called, as well as its types
                          and shapes of both inputs and outputs
         :param metadata: a metadata dict used to describe uploaded ModelVersions
         :param install_command: a command to run within a runtime to prepare a model_version environment
         :param training_data: path (absolute, relative or an S3 URI) to a csv file with the training 
                               data
         :param monitoring_configuration: Specifies a configuration to be used when monitoring the model
+        :param metric_spec_config: Metric configuration for model monitoring
         """
         if not isinstance(name, str):
             raise TypeError("name is not a string")
@@ -148,7 +153,7 @@ class LocalModel:
             raise TypeError("contract is not a ModelContract")
         validate_contract(contract)
         self.contract = contract
-        
+
         self.path = path
         self.payload = resolve_paths(path=path, payload=payload)
 
@@ -170,14 +175,65 @@ class LocalModel:
 
         if training_data and not isinstance(training_data, str):
             raise TypeError("training-data should be a string")
-        self.training_data = training_data
+
+        if training_data.startswith('s3://') or Path(training_data).is_absolute():
+            self.training_data = training_data
+        else:
+            folder_path, relative_path = Path(self.path), Path(training_data)
+            self.training_data = str((folder_path / relative_path).resolve())
 
         if monitoring_configuration and not isinstance(monitoring_configuration, MonitoringConfiguration):
             raise TypeError("monitoring-configuration should be of type MonitoringConfiguration")
         self.monitoring_configuration: MonitoringConfiguration = monitoring_configuration
 
+
     def __repr__(self):
         return f"LocalModel {self.name}"
+
+    @staticmethod
+    def from_yaml(serving_file, name: Optional[str] = None, runtime: Optional[str] = None,
+                  training_data: Optional[str] = None) -> 'LocalModel':
+        """
+        Parse model information from local definition
+
+        :param serving_file: serving.yaml file
+        :param name: optional name of a model
+        :param runtime: optional runtime
+        :param training_data: optional training data path
+        :return: LocalModel object
+
+        >>> metrics: Dict[str, MetricSpecConfig] = {}
+        >>> mv = lm.upload()
+        >>> mv.
+        """
+        # TODO add monitoring configuration
+        abs_serving_path = os.path.abspath(serving_file)
+        model_dir, serving_filename = os.path.split(abs_serving_path)
+
+        with open(abs_serving_path, 'r') as f:
+            parsed = yaml_file(f)
+        if parsed.get('kind', 'None') != 'Model':
+            raise IncorrectDefinitionException(
+                "Resource defined in {} is not a Model".format(serving_file))  # Todo define custom exceptions
+        if name is not None:
+            parsed['name'] = name
+        if runtime is not None:
+            parsed['runtime'] = runtime
+        if training_data is not None:
+            parsed['training-data'] = training_data
+
+        runtime_image = DockerImage.parse_fullname(parsed['runtime'])
+
+        model_contract = contract_from_dict(parsed['contract'])
+
+        monitoring_configuration = None
+        if 'monitoring_configuration' in parsed:
+            monitoring_configuration = MonitoringConfiguration(parsed['monitoring_configuration']['batch-size'])
+
+        lm = LocalModel(name=parsed['name'], path=model_dir, runtime=runtime_image, payload=parsed['payload'],
+                        contract=model_contract, training_data=parsed.get('training-data', None),
+                        install_command=parsed['install-command'], metadata=parsed.get('metadata', {}), monitoring_configuration=monitoring_configuration)
+        return lm
 
     def upload(self, cluster: Cluster) -> 'ModelVersion':
         """
@@ -208,7 +264,7 @@ class LocalModel:
             "installCommand": self.install_command,
             "metadata": self.metadata
         }
-        
+
         if self.monitoring_configuration:
             meta.update({"monitoringConfiguration": self.monitoring_configuration.to_dict()})
 
@@ -218,13 +274,15 @@ class LocalModel:
                 "metadata": json.dumps(meta)
             }
         )
-        
-        resp = cluster.request("POST", "/api/v2/model/upload", data=encoder, headers={'Content-Type': encoder.content_type})
+
+        resp = cluster.request("POST", "/api/v2/model/upload", data=encoder,
+                               headers={'Content-Type': encoder.content_type})
         handle_request_error(
             resp, f"Failed to upload local model. {resp.status_code} {resp.text}")
 
         modelversion = ModelVersion._from_json(cluster, resp.json())
         modelversion.training_data = self.training_data
+        modelversion.metric_spec_config = self.metric_spec_config
         return modelversion
 
 
@@ -267,7 +325,7 @@ class ModelVersion:
     >>> cluster = Cluster("http-cluster-endpoint")
     >>> model_version = ModelVersion.find(cluster, "my-model", 1)
     >>> modelversion_metric = ModelVersion.find(cluster, "my-model-metric", 1)
-    >>> modelversion_metric = modmodelversion_metric.as_metric(1.4, ThresholdCmpOp.LESS_EQ)
+    >>> modelversion_metric = modelversion_metric.as_metric(1.4, ThresholdCmpOp.LESS_EQ)
     >>> model_version.assign_metrics([modelversion_metric])
 
     Create an external model.
@@ -310,7 +368,7 @@ class ModelVersion:
             resp, f"Failed to list model versions. {resp.status_code} {resp.text}")
         return [ModelVersion._from_json(cluster, modelversion_json)
                 for modelversion_json in resp.json()]
-    
+
     @staticmethod
     def find(cluster: Cluster, name: str, version: int) -> 'ModelVersion':
         """
@@ -371,7 +429,8 @@ class ModelVersion:
         model_id = modelversion_json["model"]["id"]
         version = modelversion_json["modelVersion"]
         model_contract = contract_dict_to_ModelContract(modelversion_json["modelContract"])
-        monitoring_configuration = MonitoringConfiguration(batch_size=modelversion_json["monitoringConfiguration"]["batchSize"])
+        monitoring_configuration = MonitoringConfiguration(
+            batch_size=modelversion_json["monitoringConfiguration"]["batchSize"])
 
         # external model deserialization handling
         is_external = modelversion_json.get('isExternal', False)
@@ -403,8 +462,8 @@ class ModelVersion:
         )
 
     @staticmethod
-    def create_externalmodel(cluster: Cluster, name: str, contract: ModelContract, 
-               metadata: Optional[dict] = None, training_data: Optional[str] = None) -> 'ModelVersion':
+    def create_externalmodel(cluster: Cluster, name: str, contract: ModelContract,
+                             metadata: Optional[dict] = None, training_data: Optional[str] = None) -> 'ModelVersion':
         """
         Create an external ModelVersion on the cluster. 
 
@@ -458,7 +517,7 @@ class ModelVersion:
                         raise ModelVersion.ReleaseFailed()
         finally:
             events_client.close()
-    
+
     def build_logs(self) -> Iterator[Event]:
         """
         Sends request, saves and returns a build logs iterator.
@@ -487,7 +546,7 @@ class ModelVersion:
         """
         if wait:
             self.lock_till_released()
-        
+
         for metric in metrics:
             modelversion = metric.modelversion
             if wait:
@@ -520,7 +579,7 @@ class ModelVersion:
             image=DockerImageProto(name=self.image.name, tag=self.image.tag),
             image_sha=self.image.sha256
         )
-    
+
     def as_metric(self, threshold: int, comparator: ThresholdCmpOp) -> MetricModel:
         """
         Converts model to MetricModel.
@@ -531,11 +590,12 @@ class ModelVersion:
         """
         return MetricModel(modelversion=self, threshold=threshold, comparator=comparator)
 
-    def __init__(self, cluster: Cluster, id: int, model_id: int, name: str, version: int, 
-                 contract: ModelContract, status: Optional[ModelVersionStatus], image: Optional[DockerImage], 
-                 runtime: Optional[DockerImage], is_external: bool, 
-                 metadata: Optional[Dict[str, str]] = None, install_command: Optional[str] = None, 
-                 training_data: Optional[str] = None, monitoring_configuration: Optional[MonitoringConfiguration] = None):
+    def __init__(self, cluster: Cluster, id: int, model_id: int, name: str, version: int,
+                 contract: ModelContract, status: Optional[ModelVersionStatus], image: Optional[DockerImage],
+                 runtime: Optional[DockerImage], is_external: bool,
+                 metadata: Optional[Dict[str, str]] = None, install_command: Optional[str] = None,
+                 training_data: Optional[str] = None,
+                 monitoring_configuration: Optional[MonitoringConfiguration] = None):
         """
         :param cluster: active cluster
         :param id: id of the model_version assigned by the cluster
@@ -574,6 +634,7 @@ class ModelVersion:
     class ReleaseFailed(HydrosphereException):
         pass
 
+
 class DataProfileStatus(Enum):
     Success = "Success"
     Failure = "Failure"
@@ -604,6 +665,7 @@ class DataUploadResponse:
         except DataUploadResponse.Failed:
             print(f"Failed to process training data")
     """
+
     def __init__(self, cluster: Cluster, modelversion_id: int) -> 'DataUploadResponse':
         self.cluster = cluster
         self.modelversion_id = modelversion_id
@@ -613,7 +675,7 @@ class DataUploadResponse:
         if not hasattr(self, '__url'):
             self.__url = f'/monitoring/profiles/batch/{self.modelversion_id}/status'
         return self.__url
-    
+
     @staticmethod
     def __tick(retry: int, sleep: int) -> Tuple[bool, int]:
         if retry == 0:

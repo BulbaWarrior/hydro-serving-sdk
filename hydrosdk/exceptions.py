@@ -46,3 +46,10 @@ class ContractViolationException(HydrosphereException):
     Exception raised when contract is violated
     """
     pass
+
+
+class IncorrectDefinitionException(HydrosphereException):
+    """
+    Exception raised when hs definition could not be correctly parsed
+    """
+    pass

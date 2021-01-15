@@ -1,9 +1,11 @@
 import re
-from dataclasses import is_dataclass
 from typing import Generator, Dict
 
 import grpc
 import requests
+import yaml
+from dataclasses import is_dataclass
+from yaml.parser import ParserError
 
 from hydrosdk.exceptions import BadRequestException, BadResponseException, UnknownException
 
@@ -104,7 +106,8 @@ def enable_camel_case(cls):
                 snake_case_dict[snake_case_key] = item_type.from_camel_case_dict(v)
             else:
                 try:
-                    if item_type._name == 'List' and len(item_type.__args__) == 1 and is_dataclass(item_type.__args__[0]):
+                    if item_type._name == 'List' and len(item_type.__args__) == 1 and is_dataclass(
+                            item_type.__args__[0]):
                         snake_case_dict[snake_case_key] = [item_type.__args__[0].from_camel_case_dict(x) for x in v]
                         continue
                     else:
@@ -134,3 +137,13 @@ def enable_camel_case(cls):
     setattr(cls, "from_camel_case_dict", from_camel_case_dict)
     setattr(cls, "to_camel_case_dict", to_camel_case_dict)
     return cls
+
+
+def yaml_file(file):
+    try:
+        yaml_dict = yaml.safe_load(file)
+        return yaml_dict
+    except ParserError as ex:
+        raise ParserError(file, ex)
+    except KeyError as ex:
+        raise ParserError(file, "Can't find {} field".format(ex))
