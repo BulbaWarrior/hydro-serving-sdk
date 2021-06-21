@@ -1,3 +1,5 @@
+name: cd
+
 on:
   push:
     branches:
@@ -113,5 +115,4 @@ jobs:
           git tag $(poetry version -s)
           git push
           git push --tags
-          
           
